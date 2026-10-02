@@ -158,3 +158,99 @@ uv run crew.py     # Tech Lead + Coder team
 | Seeing what happens | Every step is my code | Hidden inside the framework (`verbose=True` helps) |
 
 **Learned:** a framework saves a lot of code and makes multi-agent easy, but it hides the loop. Building it in pure Python first is what made CrewAI make sense to me.
+
+## 2. OpenAI Agents SDK (`02_agents_sdk/`)
+
+The Agents SDK is OpenAI's own agent framework. It sits between pure Python and CrewAI: **my functions, their loop.** There is no `role` / `goal` / `backstory`. An agent is just a system prompt (`instructions`), a model and a list of tools, and `Runner` runs the model → tool → result loop for me.
+
+The code only needs a few things:
+- **Tools** — normal Python functions with a `@function_tool` decorator. Like CrewAI, the SDK reads the docstring and type hints, so no `TOOL_SCHEMAS`.
+- **Agent** — `name`, `instructions`, `model` and `tools`.
+- **Runner** — `Runner.run_sync(agent, user_input)` runs the whole loop and gives back `result.final_output`.
+- **Session** — `SQLiteSession` saves the chat history in a small database, so the agent remembers earlier messages. This replaces my `messages` list.
+
+### Running it on Gemini instead of OpenAI
+
+The SDK is made by OpenAI, but it is not locked to OpenAI models. Gemini has an **OpenAI-compatible endpoint**, so I point the OpenAI client at Google and use my free `GEMINI_API_KEY`:
+
+```python
+gemini_client = AsyncOpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+set_tracing_disabled(True)  # tracing uploads to OpenAI and would need an OpenAI key
+
+MODEL = OpenAIChatCompletionsModel(model="gemini-2.5-flash", openai_client=gemini_client)
+```
+
+- `OpenAIChatCompletionsModel` is needed because the SDK uses OpenAI's newer Responses API by default, which Gemini does not support.
+- `set_tracing_disabled(True)` turns off tracing. Tracing sends every run to OpenAI's dashboard, which needs an OpenAI key.
+- Function tools, sessions, handoffs, guardrails and structured outputs all work on Gemini. Only OpenAI's hosted tools (`WebSearchTool`, `FileSearchTool`, `CodeInterpreterTool`) don't.
+
+### `agent.py` — one agent
+
+- The same coding agent again, with the same 4 tools: `list_files`, `read_file`, `write_file`, `run_command` (still asks me `y/N` first).
+- `SQLiteSession("mini-agent")` gives it memory between messages, with no `messages` list to manage.
+- ~95 lines, and most of that is the tools.
+
+### Demo: a rock paper scissors game
+
+I asked `agent.py` to build a rock paper scissors game, and it wrote `02_agents_sdk/rock_paper_scissors.py` with its `write_file` tool. The game has a menu (`1`/`r`, `2`/`p`, `3`/`s`, `q` to quit), a random computer move, a scoreboard after every round and a final score at the end:
+
+![The rock paper scissors game built by the Agents SDK agent, running in the terminal](images/rock_paper_scissors_demo.png)
+
+To play it: `cd 02_agents_sdk` then `uv run python rock_paper_scissors.py`.
+
+### `handoff_guardrail.py` — handoffs and guardrails
+
+This is where the SDK shines. Two features that I'd have to build by hand in pure Python:
+
+**Handoffs** — a **Triage** agent reads the request and passes it to the right specialist:
+
+| Agent | Tools | Job |
+|---|---|---|
+| `triage` | none, only `handoffs=[coder, explainer]` | Decides who should handle the request |
+| `coder` | all 4 tools | Writes, edits and runs code |
+| `explainer` | `list_files`, `read_file` (read-only) | Explains the code, never changes anything |
+
+**Guardrails** — the triage agent has an `@input_guardrail` that runs a tiny **Safety check** agent on every request. It returns a structured `SafetyCheck` (`is_destructive`, `reasoning`) using `output_type`. If the request looks destructive (deleting files, wiping folders, `rm -rf`), the tripwire fires, the run is stopped with `InputGuardrailTripwireTriggered`, and I print "Blocked".
+
+By default the guardrail runs **at the same time** as the agent, to save time. To make it finish its check before the agent starts, use `@input_guardrail(run_in_parallel=False)`.
+
+### Demo: the Explainer summarizing a file
+
+I asked the triage agent to summarize a file. It handed the request to the **Explainer**, which used `read_file` and explained `handoff_guardrail.py` part by part: the `SafetyCheck` model, the guardrail agent, the `block_destructive` guardrail, the coder, and so on:
+
+![The triage agent handing off to the Explainer, which summarizes handoff_guardrail.py](images/handoff_guardrail_demo.png)
+
+Something I noticed: my first message didn't name a file, so the Explainer asked which one. When I replied with just `handoff_guardrail.py`, it had already forgotten my "50 words in English" request and gave a long breakdown instead. That's because `handoff_guardrail.py` calls `Runner.run` **without a session**, so every message starts fresh. `agent.py` remembers because it passes `session=session`.
+
+### Setup notes
+
+- `02_agents_sdk/` is its **own uv project** (Python 3.12) like `01_crewai/`, with `openai-agents` and `python-dotenv`.
+- The import is `from agents import ...`, but the package to install is `openai-agents`.
+- **Free tier limits:** the free Gemini key allows only a small number of requests per day per model. One message to `handoff_guardrail.py` uses several requests (guardrail + triage + specialist + each tool call), so I hit `429 RESOURCE_EXHAUSTED` quickly. Switching to another Gemini model helps, because each model has its own quota.
+
+### How to run
+
+```
+cd 02_agents_sdk
+uv sync
+uv run python agent.py               # one coding agent with memory
+uv run python handoff_guardrail.py   # triage + coder + explainer, with a safety guardrail
+```
+
+### Pure Python vs CrewAI vs Agents SDK
+
+| | Pure Python (`agent.py`) | CrewAI (`01_crewai/`) | Agents SDK (`02_agents_sdk/`) |
+|---|---|---|---|
+| Agent loop | I write it | Built in | Built in (`Runner`) |
+| Memory | My `messages` list | Built in | `SQLiteSession` |
+| Tool description | JSON schema by hand | Docstring + `@tool` | Docstring + `@function_tool` |
+| How you describe an agent | System prompt | `role`, `goal`, `backstory` + `Task` | `instructions` (a system prompt) |
+| Multi-agent | Hard, I'd build it all | Crew of agents + tasks | Handoffs |
+| Safety checks | I'd build it all | Checks a task's output (`guardrail` on `Task`) | Checks input and output (input/output guardrails) |
+| Setup | Light (28 packages, Python 3.10) | Heavy (144 packages, Python 3.11+) | Light (40 packages, Python 3.12) |
+| Gemini support | Native (`google-genai`) | Native (`crewai[google-genai]`) | Through the OpenAI-compatible endpoint |
+
+**Learned:** the Agents SDK feels closest to my pure Python agent: an agent is still just a system prompt + tools, and the SDK only takes over the loop and memory. Handoffs and guardrails are the big wins, and they work on Gemini too.
