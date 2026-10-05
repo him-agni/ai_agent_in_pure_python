@@ -254,3 +254,118 @@ uv run python handoff_guardrail.py   # triage + coder + explainer, with a safety
 | Gemini support | Native (`google-genai`) | Native (`crewai[google-genai]`) | Through the OpenAI-compatible endpoint |
 
 **Learned:** the Agents SDK feels closest to my pure Python agent: an agent is still just a system prompt + tools, and the SDK only takes over the loop and memory. Handoffs and guardrails are the big wins, and they work on Gemini too.
+
+## 3. LangGraph (`03_langgraph/`)
+
+LangGraph is the opposite of CrewAI: **nothing is hidden, I draw the agent myself.** The agent is a **graph**: boxes (nodes) connected by arrows (edges), with a shared state passed along. It's the same model → tool → result loop from my pure Python agent, just drawn out step by step.
+
+The code only needs a few things:
+- **State** — the data passed between steps. `MessagesState` is just the conversation (a list of messages). Every node reads it and adds new messages.
+- **Nodes** — the steps. Each one is a normal Python function that takes the state and returns what to add.
+- **Edges** — the arrows that say which node runs next. A **conditional edge** is a fork: a function looks at the state and picks the next node.
+- **Checkpointer** — `InMemorySaver` saves the state after every node, so the agent remembers earlier messages. A `thread_id` picks which conversation to continue.
+- **Tools** — normal Python functions with a `@tool` decorator. Like the other frameworks, it reads the docstring and type hints, so no `TOOL_SCHEMAS`.
+
+### Running it on Gemini
+
+LangGraph uses LangChain models, and `init_chat_model` can load any provider by its prefix:
+
+```python
+MODEL = "google_genai:gemini-2.5-flash"
+model = init_chat_model(MODEL, api_key=GEMINI_API_KEY).bind_tools(list(TOOLS.values()))
+```
+
+- The `google_genai:` prefix tells LangChain to use Gemini. It needs the `langchain-google-genai` package.
+- I pass `api_key=GEMINI_API_KEY` myself, so the same key from the `.env` works for every folder.
+
+### `agent.py` — one agent, drawn as a graph
+
+- The same 4 tools again: `list_files`, `read_file`, `write_file`, `run_command` (still asks me `y/N` first).
+- 2 nodes: `agent` (calls Gemini) and `tools` (runs the tools Gemini asked for).
+- 3 edges:
+
+```
+START ──► agent ──(asked for a tool?)── yes ──► tools
+            ▲                                     │
+            └─────────────────────────────────────┘
+                        │
+                        no
+                        ▼
+                       END
+```
+
+1. `START → agent` — every message goes to Gemini first.
+2. `agent → tools` or `END` — a conditional edge. `should_continue` checks Gemini's reply: tool asked for → `tools`, otherwise → `END`.
+3. `tools → agent` — after running a tool, always go back to Gemini with the result.
+
+In pure Python this loop was a `while` loop I wrote. Here it's the `tools → agent` edge.
+
+### `multi_agent.py` — multi-agent with a review loop
+
+This is where LangGraph shines. Each specialist is the graph from `agent.py`, compiled and dropped into a bigger graph as **one node**:
+
+```
+START -> triage -> explainer -> END
+                -> coder -> reviewer -> END
+                      ^          |
+                      +----------+   (changes requested)
+```
+
+| Node | Tools | Job |
+|---|---|---|
+| `triage` | none | Reads the request and picks `coder` or `explainer` (structured output: `Route`) |
+| `coder` | all 4 tools | Writes, edits and runs code |
+| `explainer` | `list_files`, `read_file` (read-only) | Explains the code, never changes anything |
+| `reviewer` | none | Checks the coder's work (structured output: `Review`). Approves, or sends feedback back to the coder |
+
+- The `reviewer → coder` edge makes a real **cycle**: the coder fixes what the reviewer asked for, then the reviewer checks again.
+- `MAX_REVISIONS = 2` stops it from looping forever. After 2 rounds it ships as is.
+- The state has extra fields on top of the messages: `route`, `approved` and `revisions`.
+
+### Demo: a maze game, coded, reviewed and explained
+
+I ran `multi_agent.py` and typed:
+
+```
+You: Write a maze game in Python using Pygame and review it to make sure it's accurate
+```
+
+1. **Triage** sent it to the **coder**.
+2. The **coder** wrote `maze_game.py`, then checked its own work and wrote it again to fix a size mismatch (the hardcoded maze didn't match `MAZE_WIDTH` and `MAZE_HEIGHT`).
+3. The **reviewer** approved it on the first try.
+
+Then I asked `how to play it`. Triage sent that to the **explainer**, which explained how to install Pygame and run the game. It knew which game I meant because the checkpointer kept the earlier messages:
+
+![Triage routing to the coder and reviewer, then to the explainer for a follow-up question](images/langgraph_multi_agent_demo.png)
+
+To play it: `cd 03_langgraph` then `uv run python maze_game.py` (needs `pygame` installed). Move the red square with the arrow keys and reach the green square to win.
+
+### Setup notes (what broke for me)
+
+- `03_langgraph/` is **not** its own uv project. LangGraph is light enough, so I added it to the root project with `uv add langchain langchain-google-genai langgraph` (Python 3.10). The root project went from 28 to 52 packages.
+- **Wrong environment:** at first I installed LangGraph into my system Python, not the project's `.venv`, so `uv run` failed with `No module named 'langgraph'`. Fix: `uv add`, which installs into the project and saves it in `pyproject.toml`.
+- **Gemini replies as content blocks:** Gemini sometimes returns the reply as a list of blocks (text + a `signature`), not a plain string, so `message.content` printed a raw list. Fix: print `message.text`, which gives just the text either way (done in `multi_agent.py`).
+
+### How to run
+
+```
+uv sync
+cd 03_langgraph
+uv run python agent.py         # one agent, drawn as a graph
+uv run python multi_agent.py   # triage + coder + explainer + reviewer
+```
+
+### Pure Python vs CrewAI vs Agents SDK vs LangGraph
+
+| | Pure Python (`agent.py`) | CrewAI (`01_crewai/`) | Agents SDK (`02_agents_sdk/`) | LangGraph (`03_langgraph/`) |
+|---|---|---|---|---|
+| Agent loop | I write it | Built in | Built in (`Runner`) | I draw it as nodes + edges |
+| Memory | My `messages` list | Built in | `SQLiteSession` | Checkpointer (`InMemorySaver`) |
+| Tool description | JSON schema by hand | Docstring + `@tool` | Docstring + `@function_tool` | Docstring + `@tool` |
+| How you describe an agent | System prompt | `role`, `goal`, `backstory` + `Task` | `instructions` (a system prompt) | System prompt inside a node |
+| Multi-agent | Hard, I'd build it all | Crew of agents + tasks | Handoffs | Graphs inside a graph, with cycles |
+| Safety checks | I'd build it all | Checks a task's output (`guardrail` on `Task`) | Checks input and output (input/output guardrails) | I'd add a node for it (like the reviewer) |
+| Setup | Light (28 packages, Python 3.10) | Heavy (144 packages, Python 3.11+) | Light (40 packages, Python 3.12) | Medium (52 packages with the root project, Python 3.10) |
+| Gemini support | Native (`google-genai`) | Native (`crewai[google-genai]`) | Through the OpenAI-compatible endpoint | Native (`langchain-google-genai`) |
+
+**Tradeoff:** LangGraph gives me the most control and the clearest picture of what runs when. The review loop was easy because a cycle is just one more edge. But I design every step myself, so it takes more code than CrewAI or the Agents SDK. Also, `InMemorySaver` forgets everything when the program exits, unlike the Agents SDK's `SQLiteSession`.
