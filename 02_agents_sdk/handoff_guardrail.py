@@ -15,6 +15,7 @@ from agents import (
     GuardrailFunctionOutput,
     InputGuardrailTripwireTriggered,
     Runner,
+    SQLiteSession,
     input_guardrail,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -42,6 +43,9 @@ guardrail_agent = Agent(
 
 @input_guardrail
 async def block_destructive(ctx, agent, user_input) -> GuardrailFunctionOutput:
+    # with a session, user_input is the whole chat history, so only screen the newest message
+    if isinstance(user_input, list):
+        user_input = user_input[-1:]
     check = await Runner.run(guardrail_agent, user_input, context=ctx.context)
     return GuardrailFunctionOutput(
         output_info=check.final_output,
@@ -92,15 +96,18 @@ triage = Agent(
 
 
 async def main():
+    session = SQLiteSession("triage-agent")  # remembers earlier messages, like agent.py
     print("Triage agent ready. Type 'exit' to quit.")
     while True:
         user_input = input("\nYou: ")
         if user_input.strip().lower() in ("exit", "quit"):
             break
         try:
-            result = await Runner.run(triage, user_input)
+            result = await Runner.run(triage, user_input, session=session)
             print(f"\n[{result.last_agent.name}]: {result.final_output}")
         except InputGuardrailTripwireTriggered:
+            # the SDK still saves a blocked message; drop it so a later "yes, do it" has nothing to act on
+            await session.pop_item()
             print("\n[guardrail]: Blocked. That request looked destructive.")
 
 
