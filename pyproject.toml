@@ -9,6 +9,9 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "google-genai>=1.0.0",
+    "langchain>=1.4.3",
+    "langchain-google-genai>=4.4.0",
+    "langgraph>=1.2.12",
     "python-dotenv>=1.2.3",
 ]
 
